@@ -5,3 +5,7 @@
 # @Email   : 1944303766@qq.com
 # @File    : loss.py
 # @Software: PyCharm
+
+'''
+    用来定义自己的损失函数
+'''

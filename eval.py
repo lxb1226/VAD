@@ -10,29 +10,23 @@ from sklearn import metrics
 from tqdm import tqdm
 import os
 import torch
+from loguru import logger
+
+'''
+用来自己的定义评估函数
+'''
 
 
-def evaluate(model, feat_path, lbl_dict, device):
-    """
-    :param model: the model to be evaluated
-    :param feat_path: the path where validation set features are restored
-    :param lbl_dict: a dict, wave id to frame-wise label
-    :return: auc, eer, tpr, fpr on the validation set
-    """
+def evaluate(model, val_loader, device):
     all_pred = []
     all_lbls = []
-    for audio_file in tqdm(os.listdir(feat_path)):
-        audio_id = audio_file.split('.')[0]
-        frames = np.load(os.path.join(feat_path, audio_file))
-
-        inp = torch.unsqueeze(torch.from_numpy(frames).float(), 1).to(device)
-
-        # hiddens = model.init_hiddens(batch_size=1)
-        # hiddens = (hiddens[0].to(device), hiddens[1].to(device))
-
+    for i, data in enumerate(val_loader, 0):
+        x, y = data
+        inp = x.float().to(device)
         pred = torch.squeeze(model(inp))
+
         all_pred += pred.detach().cpu().numpy().tolist()
-        all_lbls += lbl_dict[audio_id]
+        all_lbls += torch.squeeze(y.cpu())
         assert len(all_pred) == len(all_lbls)
 
     auc, eer, fpr, tpr = get_metrics(all_pred, all_lbls)

@@ -7,6 +7,9 @@
 # @Software: PyCharm
 import torch
 
+'''
+用来定义训练函数
+'''
 
 def train_gru(vad_net, inp, target, criterion, optimizer, device):
     inp.to(device)

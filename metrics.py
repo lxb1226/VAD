@@ -11,6 +11,10 @@ import os
 import numpy as np
 import torch
 
+'''
+用来计算一些性能指标
+'''
+
 
 def calc_metrics(model, feat_path, lbl_dict, L, device, thres=0.5):
     """
