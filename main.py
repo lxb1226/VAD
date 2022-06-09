@@ -25,6 +25,8 @@ from eval import compute_eer, get_metrics
 import re
 import random
 
+from loguru import logger
+
 from model.models import RNN
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -150,10 +152,10 @@ def evaluate(model, feat_path, lbl_dict):
 
         inp = torch.unsqueeze(torch.from_numpy(frames).float(), 1).to(device)
 
-        # hiddens = model.init_hiddens(batch_size=1)
-        # hiddens = (hiddens[0].to(device), hiddens[1].to(device))
+        hiddens = model.init_hiddens(batch_size=1)
+        hiddens = (hiddens[0].to(device), hiddens[1].to(device))
 
-        pred = torch.squeeze(model(inp))
+        pred = torch.squeeze(model(inp, hiddens))
         all_pred += pred.detach().cpu().numpy().tolist()
         all_lbls += lbl_dict[audio_id]
         assert len(all_pred) == len(all_lbls)
@@ -235,6 +237,45 @@ def predict(args, model, feat_path, target_path):
             f.write(test_id + " " + line + '\n')
 
 
+def extract_feature(audio_path, label, sr=8000, win_len=0.032, win_hop=0.008):
+    audio_data, _ = librosa.load(audio_path, sr=sr)
+    audio_framed, frame_len = preprocess.framing(audio_data, fs=sr, win_len=win_len,
+                                                 win_hop=win_hop)
+    frame_num = audio_framed.shape[0]
+    # assert frame_num >= len(label), "frame_num : {}, len of labels : {}".format(frame_num, len(label))
+    if frame_num > len(label):
+        label += [0] * (frame_num - len(label))
+    else:
+        label = label[: frame_num]
+    frame_energy = (audio_framed ** 2).sum(1)[:, np.newaxis]
+    frame_mfcc = mfcc.mfcc(audio_data, fs=sr, win_len=win_len, win_hop=win_hop)
+    # 联结帧能量以及mfcc特征
+    frame_feats = np.concatenate((frame_energy, frame_mfcc), axis=1)
+    # 将特征 + 能量 保存到文件中
+    return label, frame_feats
+
+
+def process_data(data_list, feat_path, json_path):
+    lbl_dict = {}
+    with open(data_list, 'r') as f:
+        lines = f.readlines()
+        for line in lines:
+            data = line.strip().split(' ')
+            audio_path = data[0].strip()
+            label = ' '.join(data[1:])
+            # logger.debug('label : {}'.format(label))
+            label = parse_vad_label(label)
+            label, frame_feats = extract_feature(audio_path, label)
+            audio_id = audio_path.strip().split('\\')[-1].split('.')[0]
+            # logger.debug("audio_id : {}, label : {}".format(audio_id, label))
+            np.save(os.path.join(feat_path, audio_id + '.npy'), frame_feats)
+            lbl_dict[audio_path] = label
+    # 保存到json文件中
+    json_str = json.dumps(lbl_dict)
+    with open(json_path, 'w') as json_file:
+        json_file.write(json_str)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description='Run LSTM for VAD')
@@ -246,28 +287,35 @@ if __name__ == "__main__":
     parser.add_argument('--lr', default=0.001, type=float)
     parser.add_argument('--num_epoch', default=10, type=int)
     parser.add_argument('--report_interval', default=50, type=int)
-    parser.add_argument('--stage', default=2, type=int)
+    parser.add_argument('--stage', default=1, type=int)
     parser.add_argument('--L', default=5, type=int)  # adjust length in VACC calculation
     parser.add_argument('--model', default='VADNet', type=str)
+    parser.add_argument('--data_path', default=r'F:\workspace\GHT\projects\vad\data', type=str, help='data path')
+    parser.add_argument('--data_list', default=r'F:\workspace\GHT\projects\vad\data\labels\train_labels.txt')
+    parser.add_argument('--val_list', default=r'F:\workspace\GHT\projects\vad\data\labels\val_labels.txt')
 
     args = parser.parse_args()
 
     # 一些文件夹的配置选项
     root = os.getcwd()
-    data_path = os.path.join(root, "data")
-    train_path = os.path.join(data_path, "wavs", "train")
-    dev_path = os.path.join(data_path, "wavs", "dev")
+    data_path = args.data_path
+    train_path = os.path.join(data_path, "dataset", "train")
+    val_path = os.path.join(data_path, "dataset", "val")
     feat_path = os.path.join(data_path, "feat")
     train_feat_path = os.path.join(feat_path, "train")
-    test_feat_path = os.path.join(feat_path, "test")
-    dev_feat_path = os.path.join(feat_path, "dev")
+
+    val_feat_path = os.path.join(feat_path, "val")
+    labels_path = os.path.join(data_path, 'labels')
 
     fig_path = os.path.join(root, "figs")
     save_path = os.path.join(root, "checkpoints")
 
+    train_labels_path = os.path.join(labels_path, r'train_lbl_dict.json')
+    val_labels_path = os.path.join(labels_path, r'val_lbl_dict.json')
+
     if not os.path.exists(feat_path):
         os.mkdir(feat_path)
-    for path in [train_feat_path, dev_feat_path, fig_path]:
+    for path in [train_feat_path, val_feat_path, fig_path]:
         if not os.path.exists(path):
             os.mkdir(path)
 
@@ -276,70 +324,23 @@ if __name__ == "__main__":
         # TODO：考虑将数据预处理以及加载封装成一个类
         print('stage 0: data preparation and feature extraction')
         # 加载训练数据集
-        train_lbl_dict = read_label_from_file(path=os.path.join(data_path, r"train_with_noise_labels.txt"))
-        for wav in tqdm(os.listdir(train_path)):
-            wav_id = wav.split('.')[0]
-            wav_file = os.path.join(train_path, wav)
-            wav_array, fs = librosa.load(wav_file, sr=args.fs)
-            wav_framed, frame_len = preprocess.framing(wav_array, fs=args.fs, win_len=args.win_len,
-                                                       win_hop=args.win_hop)
-            frame_num = wav_framed.shape[0]
-            assert frame_num >= len(train_lbl_dict[wav_id])
-            train_lbl_dict[wav_id] += [0] * (frame_num - len(train_lbl_dict[wav_id]))
+        process_data(args.data_list, train_feat_path, train_labels_path)
+        # 加载测试数据集
+        process_data(args.val_list, val_feat_path, val_labels_path)
 
-            frame_energy = (wav_framed ** 2).sum(1)[:, np.newaxis]
-            assert frame_num == len(train_lbl_dict[wav_id])
-            # 提取mfcc特征
-            frame_mfcc = mfcc.mfcc(wav_array, fs=args.fs, win_len=args.win_len, win_hop=args.win_hop)
-            # 联结帧能量以及mfcc特征
-            frame_feats = np.concatenate((frame_energy, frame_mfcc), axis=1)
-            # 将特征 + 能量 保存到文件中
-            np.save(os.path.join(train_feat_path, wav_id + '.npy'), frame_feats)
-        # if args.make_dev_lbl_dict:
-        json_str = json.dumps(train_lbl_dict)
-        with open(os.path.join(data_path, r"train_lbl_dict.json"), 'w') as json_file:
-            json_file.write(json_str)
-
-        # 加载验证集
-        dev_lbl_dict = read_label_from_file(path=os.path.join(data_path, r"dev_labels.txt"))
-        # 加载验证集
-        for wav in tqdm(os.listdir(dev_path)):
-            wav_id = wav.split('.')[0]
-            wav_file = os.path.join(dev_path, wav)
-            wav_array, fs = librosa.load(wav_file, sr=args.fs)
-            wav_framed, frame_len = preprocess.framing(wav_array, fs=args.fs, win_len=args.win_len,
-                                                       win_hop=args.win_hop)
-            frame_num = wav_framed.shape[0]
-            assert frame_num >= len(dev_lbl_dict[wav_id])
-            dev_lbl_dict[wav_id] += [0] * (frame_num - len(dev_lbl_dict[wav_id]))
-
-            frame_energy = (wav_framed ** 2).sum(1)[:, np.newaxis]
-            assert frame_num == len(dev_lbl_dict[wav_id])
-            # 提取mfcc特征
-            frame_mfcc = mfcc.mfcc(wav_array, fs=args.fs, win_len=args.win_len, win_hop=args.win_hop)
-            # 联结帧能量以及mfcc特征
-            frame_feats = np.concatenate((frame_energy, frame_mfcc), axis=1)
-            # 将特征 + 能量 保存到文件中
-            np.save(os.path.join(dev_feat_path, wav_id + '.npy'), frame_feats)
-        # if args.make_dev_lbl_dict:
-        json_str = json.dumps(dev_lbl_dict)
-        with open(os.path.join(data_path, r"dev_lbl_dict.json"), 'w') as json_file:
-            json_file.write(json_str)
-    with open(os.path.join(data_path, r"train_lbl_dict.json"), 'r') as f:
+    with open(train_labels_path, 'r') as f:
         train_lbl_dict = json.load(f)
-    with open(os.path.join(data_path, r"dev_lbl_dict.json"), 'r') as f:
-        dev_lbl_dict = json.load(f)
-    with open(os.path.join(data_path, r"test_lbl_dict.json"), 'r') as f:
-        test_lbl_dict = json.load(f)
+    with open(val_labels_path, 'r') as f:
+        val_lbl_dict = json.load(f)
     # 构建模型
     # TODO：也需要进一步封装
 
     input_dim = 14  # 1(energy)+13(mfcc)
     hidden_size = args.hidden_size
     num_layers = args.num_layers
-    # vad_net = VADnet(input_dim, hidden_size=hidden_size, num_layers=num_layers).to(device)
-    vad_net = RNN(input_dim, hidden_size=hidden_size, num_layers=num_layers, bidirectional=True, device=device).to(
-        device)
+    vad_net = VADnet(input_dim, hidden_size=hidden_size, num_layers=num_layers).to(device)
+    # vad_net = RNN(input_dim, hidden_size=hidden_size, num_layers=num_layers, bidirectional=True, device=device).to(
+    #     device)
     # Binary Cross Entropy
     criterion = nn.BCELoss()
     optimizer = torch.optim.Adam(vad_net.parameters(), lr=args.lr)
@@ -365,15 +366,18 @@ if __name__ == "__main__":
                 audio = np.load(os.path.join(train_feat_path, audio_file))
                 # frame_num * input_dim
                 inp = torch.from_numpy(audio).float().to(device)
-                target = torch.tensor(train_lbl_dict[audio_id]).float().to(device)
-                loss = trainGru(vad_net, inp, target, criterion, optimizer)
+                audio_path = train_path + "\\" + audio_id + ".wav"
+                # logger.debug("audio_path : {}".format(audio_path))
+                target = torch.tensor(train_lbl_dict[audio_path]).float().to(device)
+                # loss = trainGru(vad_net, inp, target, criterion, optimizer)
+                loss = train(vad_net, inp, target, criterion, optimizer)
                 if i % report_interval == 0:
                     print("epoch = ", epoch, "batch n = ", i, " average loss = ", interval_loss / report_interval)
                     interval_loss = 0
                 else:
                     interval_loss += loss
             vad_net.eval()
-            auc, eer, fpr, tpr = evaluate(vad_net, dev_feat_path, dev_lbl_dict)
+            auc, eer, fpr, tpr = evaluate(vad_net, val_feat_path, val_lbl_dict)
 
             plt.plot(fpr, tpr, '-.', linewidth=3,
                      label="epoch {}\nAUC={:.4f},EER={:.4f}".format(epoch, auc, eer))
@@ -385,21 +389,21 @@ if __name__ == "__main__":
         plt.ylim([0, 1])
         plt.savefig(os.path.join(fig_path, 'roc_curve.png'), dpi=100)
 
-    if args.stage <= 2:
-        # 模型评估
-        # TODO：考虑封装成一个函数
-        print('stage 2: model evaluating')
-
-        vad_net.load_state_dict(torch.load(os.path.join(save_path, f"epoch_{args.num_epoch - 1}.pth")))
-
-        # vis_sample(vad_net, test_lbl_dict, test_feat_path, fig_path, save=True)
-        # vis_sample(vad_net, dev_lbl_dict, dev_feat_path, fig_path, save=True)
-        acc, Js, Je, Jb, vacc = calc_metrics(vad_net, test_feat_path, test_lbl_dict, L=args.L, thres=0.5)
-        print('>=== ACC = {:.4f}'.format(acc))
-        print('>=== SBA = {:.4f}'.format(Js))
-        print('>=== EBA = {:.4f}'.format(Je))
-        print('>=== BP = {:.4f}'.format(Jb))
-        print('>=== VADD = {:.4f}'.format(vacc))
+    # if args.stage <= 2:
+    #     # 模型评估
+    #     # TODO：考虑封装成一个函数
+    #     print('stage 2: model evaluating')
+    #
+    #     vad_net.load_state_dict(torch.load(os.path.join(save_path, f"epoch_{args.num_epoch - 1}.pth")))
+    #
+    #     # vis_sample(vad_net, test_lbl_dict, test_feat_path, fig_path, save=True)
+    #     # vis_sample(vad_net, dev_lbl_dict, dev_feat_path, fig_path, save=True)
+    #     acc, Js, Je, Jb, vacc = calc_metrics(vad_net, test_feat_path, test_lbl_dict, L=args.L, thres=0.5)
+    #     print('>=== ACC = {:.4f}'.format(acc))
+    #     print('>=== SBA = {:.4f}'.format(Js))
+    #     print('>=== EBA = {:.4f}'.format(Je))
+    #     print('>=== BP = {:.4f}'.format(Jb))
+    #     print('>=== VADD = {:.4f}'.format(vacc))
 
     # if args.stage <= 3:
     #     # 模型在测试集的评估 即最终结果
@@ -407,7 +411,7 @@ if __name__ == "__main__":
     #     print('stage 3: model predicting')
     #     vad_net.load_state_dict(torch.load(os.path.join(save_path, f"epoch_{args.num_epoch - 1}.pth")))
     #     acc, Js, Je, Jb, vacc = calc_metrics(vad_net, test_feat_path, test_lbl_dict, L=args.L, thres=0.5)
-        # vis_sample(vad_net, dev_lbl_dict, dev_feat_path, fig_path, save=True)
-        # vis_sample(vad_net, dev_lbl_dict, dev_feat_path, fig_path, save=True)
+    # vis_sample(vad_net, dev_lbl_dict, dev_feat_path, fig_path, save=True)
+    # vis_sample(vad_net, dev_lbl_dict, dev_feat_path, fig_path, save=True)
 
     print('DONE!')
