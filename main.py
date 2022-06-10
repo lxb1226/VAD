@@ -269,7 +269,7 @@ def process_data(data_list, feat_path, json_path):
             audio_id = audio_path.strip().split('\\')[-1].split('.')[0]
             # logger.debug("audio_id : {}, label : {}".format(audio_id, label))
             np.save(os.path.join(feat_path, audio_id + '.npy'), frame_feats)
-            lbl_dict[audio_path] = label
+            lbl_dict[audio_id] = label
     # 保存到json文件中
     json_str = json.dumps(lbl_dict)
     with open(json_path, 'w') as json_file:
@@ -368,7 +368,7 @@ if __name__ == "__main__":
                 inp = torch.from_numpy(audio).float().to(device)
                 audio_path = train_path + "\\" + audio_id + ".wav"
                 # logger.debug("audio_path : {}".format(audio_path))
-                target = torch.tensor(train_lbl_dict[audio_path]).float().to(device)
+                target = torch.tensor(train_lbl_dict[audio_id]).float().to(device)
                 # loss = trainGru(vad_net, inp, target, criterion, optimizer)
                 loss = train(vad_net, inp, target, criterion, optimizer)
                 if i % report_interval == 0:
