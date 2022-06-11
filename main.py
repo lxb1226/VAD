@@ -21,7 +21,7 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from eval import get_metrics
-from model.models import DnnVAD
+from model.models import DnnVAD, RNN, VADnet
 from utils.vad_utils import parse_vad_label, prediction_to_vad_label
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -61,36 +61,6 @@ def vis_sample(model, lbl_dict, feat_path, fig_path, save=True):
     plt.show()
 
 
-class VADnet(nn.Module):
-    def __init__(self, input_dim, hidden_size, num_layers):
-        super(VADnet, self).__init__()
-        self.hidden_size = hidden_size
-        self.input_dim = input_dim
-        self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size=input_dim,
-                            hidden_size=hidden_size, num_layers=num_layers, bias=True, batch_first=False,
-                            bidirectional=True)
-        self.fc = nn.Linear(in_features=2 * hidden_size,
-                            out_features=1, bias=True)
-        self.sigmoid = nn.Sigmoid()
-
-    def init_hiddens(self, batch_size):
-        # hidden state should be (num_layers*num_directions, batch_size, hidden_size)
-        # returns a hidden state and a cell state
-        return (torch.rand(size=(self.num_layers * 2, batch_size, self.hidden_size)),) * 2
-
-    def forward(self, input_data, hiddens):
-        '''
-        input_data : (seq_len, batchsize, input_dim)
-        '''
-
-        outputs, hiddens = self.lstm(input_data, hiddens)
-        # outputs: (seq_len, batch_size, num_directions* hidden_size)
-        pred = self.fc(outputs)
-        pred = self.sigmoid(pred)
-        return pred
-
-
 def train_dnn(dnn_net, inp, target, criterion, optimizer):
     # if inp.ndim == 2:
     #     inp.unsqueeze_(1).float()
@@ -109,7 +79,7 @@ def train_dnn(dnn_net, inp, target, criterion, optimizer):
     return loss.item()
 
 
-def trainGru(gru_net, inp, target, criterion, optimizer):
+def train_rnn(gru_net, inp, target, criterion, optimizer):
     if inp.ndim == 2:
         inp.unsqueeze_(1).float()
     if target.ndim == 1:
@@ -125,7 +95,7 @@ def trainGru(gru_net, inp, target, criterion, optimizer):
     return loss.item()
 
 
-def train(vad_net, inp, target, criterion, optimizer):
+def train_lstm(vad_net, inp, target, criterion, optimizer):
     """
     :param inp: (seq_len, batch_size, feat_dim) seq_len * batch_size(1) *feat_dim
     :param vad_net: the model
@@ -176,7 +146,7 @@ def evaluate_dnn(model, feat_path, lbl_dict):
     return auc, eer, fpr, tpr
 
 
-def evaluate(model, feat_path, lbl_dict):
+def evaluate_rnn(model, feat_path, lbl_dict):
     """
     :param model: the model to be evaluated
     :param feat_path: the path where validation set features are restored
@@ -195,6 +165,32 @@ def evaluate(model, feat_path, lbl_dict):
         hiddens = (hiddens[0].to(device), hiddens[1].to(device))
 
         pred = torch.squeeze(model(inp))
+        all_pred += pred.detach().cpu().numpy().tolist()
+        all_lbls += lbl_dict[audio_id]
+        assert len(all_pred) == len(all_lbls)
+
+    auc, eer, fpr, tpr = get_metrics(all_pred, all_lbls)
+    return auc, eer, fpr, tpr
+
+def evaluate_lstm(model, feat_path, lbl_dict):
+    """
+    :param model: the model to be evaluated
+    :param feat_path: the path where validation set features are restored
+    :param lbl_dict: a dict, wave id to frame-wise label
+    :return: auc, eer, tpr, fpr on the validation set
+    """
+    all_pred = []
+    all_lbls = []
+    for audio_file in tqdm(os.listdir(feat_path)):
+        audio_id = audio_file.split('.')[0]
+        frames = np.load(os.path.join(feat_path, audio_file))
+
+        inp = torch.unsqueeze(torch.from_numpy(frames).float(), 1).to(device)
+
+        hiddens = model.init_hiddens(batch_size=1)
+        hiddens = (hiddens[0].to(device), hiddens[1].to(device))
+
+        pred = torch.squeeze(model(inp, hiddens))
         all_pred += pred.detach().cpu().numpy().tolist()
         all_lbls += lbl_dict[audio_id]
         assert len(all_pred) == len(all_lbls)
@@ -328,7 +324,7 @@ if __name__ == "__main__":
     parser.add_argument('--report_interval', default=50, type=int)
     parser.add_argument('--stage', default=1, type=int)
     parser.add_argument('--L', default=5, type=int)  # adjust length in VACC calculation
-    parser.add_argument('--model', default='VADNet', type=str)
+    parser.add_argument('--model_type', default='lstm', type=str)
     parser.add_argument('--data_path', default=r'F:\workspace\GHT\projects\vad\data', type=str, help='data path')
     parser.add_argument('--data_list', default=r'F:\workspace\GHT\projects\vad\data\labels\train_labels.txt')
     parser.add_argument('--val_list', default=r'F:\workspace\GHT\projects\vad\data\labels\val_labels.txt')
@@ -372,21 +368,30 @@ if __name__ == "__main__":
     with open(val_labels_path, 'r') as f:
         val_lbl_dict = json.load(f)
     # 构建模型
-    # TODO：也需要进一步封装
 
     input_dim = 14  # 1(energy)+13(mfcc)
     hidden_size = args.hidden_size
     num_layers = args.num_layers
-    # vad_net = VADnet(input_dim, hidden_size=hidden_size, num_layers=num_layers).to(device)
-    # vad_net = RNN(input_dim, hidden_size=hidden_size, num_layers=num_layers, bidirectional=True, device=device).to(
-    #     device)
 
-    # DNN
-    vad_net = DnnVAD(input_dim).to(device)
+    # 选择训练模型所需要的参数以及函数
+    model_type = args.model_type
+    if model_type == 'dnn':
+        vad_net = DnnVAD(input_dim).to(device)
+        criterion = nn.CrossEntropyLoss()
+        evaluate = evaluate_dnn
+        train = train_dnn
+    elif model_type == 'rnn':
+        vad_net = RNN(input_dim, hidden_size=hidden_size, num_layers=num_layers, bidirectional=True, device=device).to(
+            device)
+        criterion = nn.BCELoss()
+        evaluate = evaluate_rnn
+        train = train_rnn
+    elif model_type == 'lstm':
+        vad_net = VADnet(input_dim, hidden_size=hidden_size, num_layers=num_layers).to(device)
+        criterion = nn.BCELoss()
+        evaluate = evaluate_lstm
+        train = train_lstm
 
-    # Binary Cross Entropy
-    # criterion = nn.BCELoss()
-    criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(vad_net.parameters(), lr=args.lr)
     report_interval = args.report_interval
     interval_loss = 0
@@ -414,15 +419,17 @@ if __name__ == "__main__":
                 # logger.debug("audio_path : {}".format(audio_path))
                 target = torch.tensor(train_lbl_dict[audio_id]).float().to(device)
                 # loss = trainGru(vad_net, inp, target, criterion, optimizer)
-                # loss = train(vad_net, inp, target, criterion, optimizer)
-                loss = train_dnn(vad_net, inp, target, criterion, optimizer)
+                # loss = train_rnn(vad_net, inp, target, criterion, optimizer)
+                # loss = train_dnn(vad_net, inp, target, criterion, optimizer)
+                loss = train(vad_net, inp, target, criterion, optimizer)
                 if i % report_interval == 0:
                     print("epoch = ", epoch, "batch n = ", i, " average loss = ", interval_loss / report_interval)
                     interval_loss = 0
                 else:
                     interval_loss += loss
             vad_net.eval()
-            auc, eer, fpr, tpr = evaluate_dnn(vad_net, val_feat_path, val_lbl_dict)
+            # auc, eer, fpr, tpr = evaluate_dnn(vad_net, val_feat_path, val_lbl_dict)
+            auc, eer, fpr, tpr = evaluate(vad_net, val_feat_path, val_lbl_dict)
 
             plt.plot(fpr, tpr, '-.', linewidth=3,
                      label="epoch {}\nAUC={:.4f},EER={:.4f}".format(epoch, auc, eer))
