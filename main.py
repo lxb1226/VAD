@@ -6,28 +6,23 @@
 # @File    : main.py
 # @Software: PyCharm
 
-import spafe
-import spafe.utils.preprocessing as preprocess
-import spafe.features.mfcc as mfcc
-import librosa
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-import matplotlib.pyplot as plt
-import os
-from tqdm import tqdm
-import json
 import argparse
-from utils.vad_utils import parse_vad_label, prediction_to_vad_label
-from utils.vad_utils import read_label_from_file
-from eval import compute_eer, get_metrics
-import re
+import json
+import os
 import random
 
-from loguru import logger
+import librosa
+import matplotlib.pyplot as plt
+import numpy as np
+import spafe.features.mfcc as mfcc
+import spafe.utils.preprocessing as preprocess
+import torch
+import torch.nn as nn
+from tqdm import tqdm
 
-from model.models import RNN
+from eval import get_metrics
+from model.models import DnnVAD
+from utils.vad_utils import parse_vad_label, prediction_to_vad_label
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -96,6 +91,24 @@ class VADnet(nn.Module):
         return pred
 
 
+def train_dnn(dnn_net, inp, target, criterion, optimizer):
+    # if inp.ndim == 2:
+    #     inp.unsqueeze_(1).float()
+    # if target.ndim == 1:
+    #     target.unsqueeze_(1).float()
+    inp.to(device)
+    target.to(device)
+
+    optimizer.zero_grad()
+    outputs = dnn_net(inp)
+    preds = torch.argmax(outputs, dim=1)
+    # preds = preds.float()
+    loss = criterion(outputs, target.long())
+    loss.backward()
+    optimizer.step()
+    return loss.item()
+
+
 def trainGru(gru_net, inp, target, criterion, optimizer):
     if inp.ndim == 2:
         inp.unsqueeze_(1).float()
@@ -137,6 +150,32 @@ def train(vad_net, inp, target, criterion, optimizer):
     return loss.item()
 
 
+def evaluate_dnn(model, feat_path, lbl_dict):
+    """
+    :param model: the model to be evaluated
+    :param feat_path: the path where validation set features are restored
+    :param lbl_dict: a dict, wave id to frame-wise label
+    :return: auc, eer, tpr, fpr on the validation set
+    """
+    all_pred = []
+    all_lbls = []
+    for audio_file in tqdm(os.listdir(feat_path)):
+        audio_id = audio_file.split('.')[0]
+        frames = np.load(os.path.join(feat_path, audio_file))
+
+        # inp = torch.unsqueeze(torch.from_numpy(frames).float(), 1).to(device)
+        inp = torch.from_numpy(frames).float().to(device)
+
+        outputs = model(inp)
+        pred = torch.argmax(outputs, dim=1)
+        all_pred += pred.detach().cpu().numpy().tolist()
+        all_lbls += lbl_dict[audio_id]
+        assert len(all_pred) == len(all_lbls)
+
+    auc, eer, fpr, tpr = get_metrics(all_pred, all_lbls)
+    return auc, eer, fpr, tpr
+
+
 def evaluate(model, feat_path, lbl_dict):
     """
     :param model: the model to be evaluated
@@ -155,7 +194,7 @@ def evaluate(model, feat_path, lbl_dict):
         hiddens = model.init_hiddens(batch_size=1)
         hiddens = (hiddens[0].to(device), hiddens[1].to(device))
 
-        pred = torch.squeeze(model(inp, hiddens))
+        pred = torch.squeeze(model(inp))
         all_pred += pred.detach().cpu().numpy().tolist()
         all_lbls += lbl_dict[audio_id]
         assert len(all_pred) == len(all_lbls)
@@ -338,11 +377,16 @@ if __name__ == "__main__":
     input_dim = 14  # 1(energy)+13(mfcc)
     hidden_size = args.hidden_size
     num_layers = args.num_layers
-    vad_net = VADnet(input_dim, hidden_size=hidden_size, num_layers=num_layers).to(device)
+    # vad_net = VADnet(input_dim, hidden_size=hidden_size, num_layers=num_layers).to(device)
     # vad_net = RNN(input_dim, hidden_size=hidden_size, num_layers=num_layers, bidirectional=True, device=device).to(
     #     device)
+
+    # DNN
+    vad_net = DnnVAD(input_dim).to(device)
+
     # Binary Cross Entropy
-    criterion = nn.BCELoss()
+    # criterion = nn.BCELoss()
+    criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(vad_net.parameters(), lr=args.lr)
     report_interval = args.report_interval
     interval_loss = 0
@@ -370,14 +414,15 @@ if __name__ == "__main__":
                 # logger.debug("audio_path : {}".format(audio_path))
                 target = torch.tensor(train_lbl_dict[audio_id]).float().to(device)
                 # loss = trainGru(vad_net, inp, target, criterion, optimizer)
-                loss = train(vad_net, inp, target, criterion, optimizer)
+                # loss = train(vad_net, inp, target, criterion, optimizer)
+                loss = train_dnn(vad_net, inp, target, criterion, optimizer)
                 if i % report_interval == 0:
                     print("epoch = ", epoch, "batch n = ", i, " average loss = ", interval_loss / report_interval)
                     interval_loss = 0
                 else:
                     interval_loss += loss
             vad_net.eval()
-            auc, eer, fpr, tpr = evaluate(vad_net, val_feat_path, val_lbl_dict)
+            auc, eer, fpr, tpr = evaluate_dnn(vad_net, val_feat_path, val_lbl_dict)
 
             plt.plot(fpr, tpr, '-.', linewidth=3,
                      label="epoch {}\nAUC={:.4f},EER={:.4f}".format(epoch, auc, eer))

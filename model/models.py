@@ -8,7 +8,30 @@
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
+
+class DnnVAD(nn.Module):
+    def __init__(self, input_dim=12, out_dim=2) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, 32)
+        self.bn1 = nn.BatchNorm1d(32)
+
+        self.fc2 = nn.Linear(32, 32)
+        self.bn2 = nn.BatchNorm1d(32)
+
+        self.fc3 = nn.Linear(32, 32)
+        self.bn3 = nn.BatchNorm1d(32)
+
+        self.last = nn.Linear(32, out_dim)
+
+    def forward(self, x):
+        out = F.relu(self.bn1((self.fc1(x))))
+        out = F.relu(self.bn2((self.fc2(out))))
+        out = F.relu(self.bn3((self.fc3(out))))
+
+        out = self.last(out)
+        return out
 
 class RNN(nn.Module):
     def __init__(self, input_dim, hidden_size, num_layers=1, bidirectional=True, device="cpu"):
