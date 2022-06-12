@@ -324,7 +324,7 @@ if __name__ == "__main__":
     parser.add_argument('--report_interval', default=50, type=int)
     parser.add_argument('--stage', default=1, type=int)
     parser.add_argument('--L', default=5, type=int)  # adjust length in VACC calculation
-    parser.add_argument('--model_type', default='lstm', type=str)
+    parser.add_argument('--model_type', default='dnn', type=str)
     parser.add_argument('--data_path', default=r'F:\workspace\GHT\projects\vad\data', type=str, help='data path')
     parser.add_argument('--data_list', default=r'F:\workspace\GHT\projects\vad\data\labels\train_labels.txt')
     parser.add_argument('--val_list', default=r'F:\workspace\GHT\projects\vad\data\labels\val_labels.txt')

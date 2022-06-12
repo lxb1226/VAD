@@ -33,6 +33,7 @@ class DnnVAD(nn.Module):
         out = self.last(out)
         return out
 
+
 class RNN(nn.Module):
     def __init__(self, input_dim, hidden_size, num_layers=1, bidirectional=True, device="cpu"):
         super(RNN, self).__init__()
